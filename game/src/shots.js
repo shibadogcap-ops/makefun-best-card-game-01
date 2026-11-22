@@ -1,79 +1,114 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// Deterministic screenshot scenes behind ?shot=title|table|win|loss. Each scene
+// drives the real rules forward with a fixed 16 ms step and a simple scripted
+// policy, so the captured frame is one the game actually produces for the seed.
+// End screens are reached honestly through clashes; the fallback only nudges a
+// Life total and then lets the normal damage rule finish the match.
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+import { SCREEN } from './game.js';
+import { effectiveValue } from './deck.js';
+import { middleIndex } from './input.js';
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
-}
+const STEP_MS = 16;
+const TABLE_CLASHES = 4;
+const TABLE_STEP_CAP = 4000;
+const END_STEP_CAP = 20000;
+const FLORISH_STEPS = 30;
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
+// Legacy shot names from earlier entries still resolve: start -> title,
+// play -> table, end -> win. Unknown names fall back to the title scene.
+const ALIASES = { start: 'title', play: 'table', end: 'win' };
+
+function indexOfBest(hand, trumpSuit) {
+  let best = 0;
+  let bestValue = -Infinity;
+  for (let i = 0; i < hand.length; i += 1) {
+    const value = effectiveValue(hand[i], trumpSuit);
+    if (value > bestValue) {
+      bestValue = value;
+      best = i;
     }
   }
   return best;
 }
 
+function indexOfWorst(hand, trumpSuit) {
+  let worst = 0;
+  let worstValue = Infinity;
+  for (let i = 0; i < hand.length; i += 1) {
+    const value = effectiveValue(hand[i], trumpSuit);
+    if (value < worstValue) {
+      worstValue = value;
+      worst = i;
+    }
+  }
+  return worst;
+}
+
 /**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
+ * Play scripted clashes until `done(game)` is true, the match ends, or the step
+ * cap is hit. `choose(game)` returns the player-hand index to commit whenever
+ * the phase is 'pick'.
  */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+function runClashes(game, choose, done, cap) {
+  let steps = 0;
+  while (steps < cap && game.screen === SCREEN.TABLE && !done(game)) {
+    if (game.phase === 'pick' && game.playerHand.length > 0) {
+      game.playCard(choose(game));
+    }
+    game.step(STEP_MS);
+    steps += 1;
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+}
+
+/**
+ * Stage the named scene on `game` (mutated in place) and return the shot name
+ * that was staged. `game` is expected fresh from createGame(seed).
+ */
+export function stageShot(name, game) {
+  const shot = ALIASES[name] || name;
+
+  if (shot !== 'table' && shot !== 'win' && shot !== 'loss') {
+    // Fresh title screen; step so the idle float/pulse animation has settled.
+    for (let i = 0; i < 120; i += 1) game.step(STEP_MS);
+    return 'title';
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+
+  game.start();
+
+  if (shot === 'table') {
+    // Middle-card policy until four clashes have resolved and it is our pick
+    // again; hands are full (5) at that point, Life bars are partly spent.
+    runClashes(
+      game,
+      (g) => middleIndex(g.playerHand.length),
+      (g) => g.clashCount >= TABLE_CLASHES && g.phase === 'pick',
+      TABLE_STEP_CAP,
+    );
+    game.hoverIndex = game.playerHand.length > 0 ? middleIndex(game.playerHand.length) : null;
+    return 'table';
+  }
+
+  const wantWin = shot === 'win';
+  const wanted = wantWin ? SCREEN.WIN : SCREEN.LOSS;
+  const choose = wantWin
+    ? (g) => indexOfBest(g.playerHand, g.trumpSuit)
+    : (g) => indexOfWorst(g.playerHand, g.trumpSuit);
+
+  runClashes(game, choose, () => game.screen !== SCREEN.TABLE, END_STEP_CAP);
+
+  // If the scripted policy never reached the wanted screen — the match ended
+  // the other way, or the step cap hit mid-table — deal a fresh match, set the
+  // relevant Life to 1, and let the real clash rules finish it.
+  for (let attempt = 0; attempt < 8 && game.screen !== wanted; attempt += 1) {
+    game.newMatch();
+    if (wantWin) game.aiLife = 1;
+    else game.playerLife = 1;
+    runClashes(game, choose, () => game.screen !== SCREEN.TABLE, END_STEP_CAP);
+  }
+
+  // Let the end-screen flourish (particles, pulse) play a moment.
+  for (let i = 0; i < FLORISH_STEPS && game.screen !== SCREEN.TABLE; i += 1) {
+    game.step(STEP_MS);
+  }
+  return game.screen === SCREEN.WIN ? 'win' : 'loss';
 }

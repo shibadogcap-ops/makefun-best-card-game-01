@@ -1,134 +1,104 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
+// Boot and the one loop for AETHER CLASH: the renderer owns the canvas transform,
+// input maps client pixels into the 1280x720 field, and game.step(dt) advances
+// the clash timeline with real frame deltas (clamped to 50 ms so a stalled tab
+// doesn't fast-forward a duel).
 //
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// ?seed=N fixes the shuffle and the rival's habits (default 20261122).
+// ?shot=title|table|win|loss stages a deterministic scene instead of running
+// interactively: it is drawn once, then the loop only idles the end/title
+// screens — the table shot stays frozen so the captured frame is exact.
+
+import { VIEW } from './config.js';
+import { createGame, SCREEN } from './game.js';
+import { createRenderer } from './render.js';
+import { createAudio } from './audio.js';
+import { attachInput } from './input.js';
 import { stageShot } from './shots.js';
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
-const MAX_FRAME = 0.25;
+const MAX_FRAME_MS = 50;
+const SHOT_STEP_MS = 16;
 
 const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
+const shotName = params.get('shot');
 const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+const seed = Number.isInteger(seedParam) ? seedParam : 20261122;
 
 const canvas = document.getElementById('game');
 const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
+
+canvas.setAttribute(
+  'aria-label',
+  'Aether Clash: a card duel against the rival Kael — pick one of five cards, ' +
+  'watch the rival\'s answer flip over, and the rotating trump suit decides each clash',
+);
+
+// Size the backing store to the window at up to 2x density; the renderer's own
+// resize listener recomputes the letterboxed view transform from this.
+function sizeCanvas() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.max(1, Math.round(window.innerWidth * dpr));
+  canvas.height = Math.max(1, Math.round(window.innerHeight * dpr));
+}
+sizeCanvas();
+window.addEventListener('resize', sizeCanvas);
+
 const renderer = createRenderer(canvas);
+const audio = createAudio();
+const game = createGame(seed);
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
-  }
+/** Client pixel -> virtual 1280x720 coordinate, matching the renderer's fit. */
+function toVirtual(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const px = (clientX - rect.left) * dpr;
+  const py = (clientY - rect.top) * dpr;
+  const scale = Math.min(canvas.width / VIEW.width, canvas.height / VIEW.height);
+  const offsetX = (canvas.width - VIEW.width * scale) / 2;
+  const offsetY = (canvas.height - VIEW.height * scale) / 2;
+  return { x: (px - offsetX) / scale, y: (py - offsetY) / scale };
 }
 
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
-  }
-}
-
-function runShot(name) {
-  const scene = stageShot(name, world);
+if (shotName) {
+  const staged = stageShot(shotName, game);
+  // Idle screens keep animating (title float, victory particles); the table
+  // shot must stay pixel-frozen, so it never steps.
+  const idle = staged === 'title' || staged === 'win' || staged === 'loss';
   let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
+  function frame() {
+    if (idle) game.step(SHOT_STEP_MS);
+    renderer.draw(game);
     painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
+    if (painted === 2) window.__shotReady = true;
+    requestAnimationFrame(frame);
   }
-  requestAnimationFrame(paint);
-}
+  requestAnimationFrame(frame);
+} else {
+  if (status) status.textContent = game.banner || 'Aether Clash. Press Enter or click to play.';
+  attachInput(canvas, game, audio, toVirtual);
 
-function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
+  let lastScreen = game.screen;
+  let lastPhase = game.phase;
   let last = performance.now();
-
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
-  }
-
-  function startGame() {
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
-  }
-
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
-    }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
-  }
-
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
-  }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
-      return;
-    }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
-  }
 
   function frame(now) {
     requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
+    const dt = Math.min(now - last, MAX_FRAME_MS);
     last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
-        accumulator -= STEP;
-      }
-    } else {
-      accumulator = 0;
+    game.step(dt);
+
+    // One-shot cues for the moments the rules produce.
+    if (game.phase === 'reveal' && lastPhase !== 'reveal') audio.flip();
+    if (game.phase === 'banner' && lastPhase !== 'banner' && game.bannerKind !== 'tie') {
+      audio.damage();
     }
-    renderer.draw(world.state, screen, best);
+    if (game.screen !== lastScreen) {
+      if (game.screen === SCREEN.WIN) audio.win();
+      else if (game.screen === SCREEN.LOSS) audio.lose();
+    }
+    lastScreen = game.screen;
+    lastPhase = game.phase;
+
+    renderer.draw(game);
   }
-
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
-  });
-
-  announce('Block Dodger. Press Space or click to start.');
   requestAnimationFrame(frame);
 }
-
-if (shot) runShot(shot);
-else runGame();
